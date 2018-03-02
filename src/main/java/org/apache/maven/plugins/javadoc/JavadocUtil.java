@@ -26,16 +26,17 @@ import org.apache.http.HttpStatus;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.Credentials;
 import org.apache.http.auth.UsernamePasswordCredentials;
-import org.apache.http.client.HttpClient;
+import org.apache.http.client.CredentialsProvider;
+import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.HttpGet;
-import org.apache.http.client.params.ClientPNames;
 import org.apache.http.client.protocol.HttpClientContext;
-import org.apache.http.conn.params.ConnRoutePNames;
-import org.apache.http.impl.client.DefaultHttpClient;
-import org.apache.http.impl.conn.PoolingClientConnectionManager;
+import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
 import org.apache.http.message.BasicHeader;
-import org.apache.http.params.CoreConnectionPNames;
-import org.apache.http.params.CoreProtocolPNames;
 import org.apache.maven.plugin.logging.Log;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.settings.Proxy;
@@ -74,7 +75,6 @@ import java.io.OutputStreamWriter;
 import java.io.PrintStream;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Modifier;
-import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
@@ -1641,10 +1641,8 @@ public class JavadocUtil
         {
             return url;
         }
-        HttpClient httpClient = null;
-        try
+        try ( CloseableHttpClient httpClient = createHttpClient( settings, url ) )
         {
-            httpClient = createHttpClient( settings, url );
             HttpClientContext httpContext = HttpClientContext.create();
             HttpGet httpMethod = new HttpGet( url.toString() );
             HttpResponse response = httpClient.execute( httpMethod, httpContext );
@@ -1657,13 +1655,6 @@ public class JavadocUtil
 
             List<URI> redirects = httpContext.getRedirectLocations();
             return isEmpty( redirects ) ? url : redirects.get( redirects.size() - 1 ).toURL();
-        }
-        finally
-        {
-            if ( httpClient != null )
-            {
-                httpClient.getConnectionManager().shutdown();
-            }
         }
     }
 
@@ -1689,8 +1680,7 @@ public class JavadocUtil
         }
 
         BufferedReader reader = null;
-        HttpGet httpMethod = null;
-        HttpClient httpClient = null;
+        CloseableHttpClient httpClient = null;
 
         try
         {
@@ -1704,17 +1694,8 @@ public class JavadocUtil
                 // http, https...
                 httpClient = createHttpClient( settings, url );
 
-                httpMethod = new HttpGet( url.toString() );
-                HttpResponse response;
-                try
-                {
-                    response = httpClient.execute( httpMethod );
-                }
-                catch ( SocketTimeoutException e )
-                {
-                    // could be a sporadic failure, one more retry before we give up
-                    response = httpClient.execute( httpMethod );
-                }
+                HttpGet httpMethod = new HttpGet( url.toString() );
+                HttpResponse response = httpClient.execute( httpMethod );
 
                 int status = response.getStatusLine().getStatusCode();
                 if ( status != HttpStatus.SC_OK )
@@ -1747,13 +1728,9 @@ public class JavadocUtil
         {
             IOUtil.close( reader );
 
-            if ( httpMethod != null )
-            {
-                httpMethod.releaseConnection();
-            }
             if ( httpClient != null )
             {
-                httpClient.getConnectionManager().shutdown();
+                httpClient.close();
             }
         }
     }
@@ -1807,20 +1784,21 @@ public class JavadocUtil
      * @see #DEFAULT_TIMEOUT
      * @since 2.8
      */
-    private static HttpClient createHttpClient( Settings settings, URL url )
+    private static CloseableHttpClient createHttpClient( Settings settings, URL url )
     {
-        DefaultHttpClient httpClient = new DefaultHttpClient( new PoolingClientConnectionManager() );
-        httpClient.getParams().setIntParameter( CoreConnectionPNames.SO_TIMEOUT, DEFAULT_TIMEOUT );
-        httpClient.getParams().setIntParameter( CoreConnectionPNames.CONNECTION_TIMEOUT, DEFAULT_TIMEOUT );
-        httpClient.getParams().setBooleanParameter( ClientPNames.ALLOW_CIRCULAR_REDIRECTS, true );
-
+        HttpClientBuilder builder = HttpClients.custom();
+        builder.setConnectionManager( new PoolingHttpClientConnectionManager() );
+        builder.setDefaultRequestConfig( RequestConfig.custom()
+                                           .setSocketTimeout( DEFAULT_TIMEOUT )
+                                           .setConnectTimeout( DEFAULT_TIMEOUT )
+                                           .setCircularRedirectsAllowed( true ).build()
+        );
         // Some web servers don't allow the default user-agent sent by httpClient
-        httpClient.getParams().setParameter( CoreProtocolPNames.USER_AGENT,
-                                             "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.0)" );
-
+        builder.setUserAgent( "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.0)" );
         // Some server reject requests that do not have an Accept header
-        httpClient.getParams().setParameter( ClientPNames.DEFAULT_HEADERS,
-                                             Arrays.asList( new BasicHeader( HttpHeaders.ACCEPT, "*/*" ) ) );
+        builder.setDefaultHeaders( Arrays.asList( new BasicHeader( HttpHeaders.ACCEPT, "*/*" ) ) );
+
+        builder.setRetryHandler( new DefaultHttpRequestRetryHandler( 1, false ) );
 
         if ( settings != null && settings.getActiveProxy() != null )
         {
@@ -1833,19 +1811,21 @@ public class JavadocUtil
                 && ( url == null || !ProxyUtils.validateNonProxyHosts( proxyInfo, url.getHost() ) ) )
             {
                 HttpHost proxy = new HttpHost( activeProxy.getHost(), activeProxy.getPort() );
-                httpClient.getParams().setParameter( ConnRoutePNames.DEFAULT_PROXY, proxy );
+                builder.setProxy( proxy );
 
                 if ( StringUtils.isNotEmpty( activeProxy.getUsername() ) && activeProxy.getPassword() != null )
                 {
                     Credentials credentials =
                         new UsernamePasswordCredentials( activeProxy.getUsername(), activeProxy.getPassword() );
 
-                    httpClient.getCredentialsProvider().setCredentials( AuthScope.ANY, credentials );
+                    CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+                    credentialsProvider.setCredentials( AuthScope.ANY, credentials );
+                    builder.setDefaultCredentialsProvider( credentialsProvider );
                 }
             }
         }
 
-        return httpClient;
+        return builder.build();
     }
 
     static boolean equalsIgnoreCase( String value, String... strings )
